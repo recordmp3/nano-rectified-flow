@@ -1,26 +1,13 @@
 """
-Minimal Qwen-like LLM — pure Megatron-Core.
-
-Everything (RoPE, RMSNorm, GQA, SwiGLU, TP, CP, PP) is handled by
-megatron.core.models.gpt.GPTModel.  FSDP wraps the DP dimension.
-
-    pip install megatron-core
+Minimal Qwen-like LLM.
+Key features: RMSNorm, RoPE, GQA (grouped-query attention), SwiGLU FFN.
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 from dataclasses import dataclass
-from functools import partial
 
-from megatron.core import parallel_state as mpu
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-
-
-# ── Config ──────────────────────────────────────────────────────────────────
 
 @dataclass
 class QwenConfig:
@@ -28,98 +15,141 @@ class QwenConfig:
     dim: int = 512
     n_layers: int = 8
     n_head: int = 8
-    n_kv_head: int = 2
-    ffn_hidden: int = 1536
+    n_kv_head: int = 2        # GQA
+    ffn_hidden: int = 1536     # ~3x dim for SwiGLU
     max_len: int = 2048
     norm_eps: float = 1e-6
 
 
-def _to_megatron(cfg: QwenConfig) -> TransformerConfig:
-    """Convert QwenConfig → Megatron TransformerConfig."""
-    return TransformerConfig(
-        num_layers=cfg.n_layers,
-        hidden_size=cfg.dim,
-        num_attention_heads=cfg.n_head,
-        num_query_groups=cfg.n_kv_head,        # GQA
-        ffn_hidden_size=cfg.ffn_hidden,
-        max_position_embeddings=cfg.max_len,
-        normalization="RMSNorm",
-        layernorm_epsilon=cfg.norm_eps,
-        position_embedding_type="rope",
-        rotary_base=10000,
-        activation_func=F.silu,
-        gated_linear_unit=True,                 # SwiGLU
-        bias=False,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        use_cpu_initialization=True,
-    )
+# ── RMSNorm ──────────────────────────────────────────────────────────────────
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps).to(x.dtype) * self.w
 
 
-# ── Build model ─────────────────────────────────────────────────────────────
+# ── Rotary Position Embedding ────────────────────────────────────────────────
 
-def build_model(cfg: QwenConfig, tp=1, cp=1, pp=1, device="cuda"):
-    """
-    Usage:
-        dist.init_process_group("nccl")
-        cfg = QwenConfig(dim=4096, n_layers=32)
-        model = build_model(cfg, tp=2, cp=2, pp=4)
-        opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
-        for batch in loader:
-            losses = train_step(model, iter([batch]), cfg)
-            opt.step(); opt.zero_grad()
-    """
-    mpu.initialize_model_parallel(
-        tensor_model_parallel_size=tp,
-        pipeline_model_parallel_size=pp,
-        context_parallel_size=cp,
-    )
-
-    mcfg = _to_megatron(cfg)
-    model = GPTModel(
-        config=mcfg,
-        transformer_layer_spec=get_gpt_layer_local_spec(),
-        vocab_size=cfg.vocab_size,
-        max_sequence_length=cfg.max_len,
-        pre_process=mpu.is_pipeline_first_stage(),
-        post_process=mpu.is_pipeline_last_stage(),
-    ).to(device)
-
-    # FSDP across DP ranks
-    if mpu.get_data_parallel_world_size() > 1:
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
-        dp = mpu.get_data_parallel_group()
-        model = FSDP(model, process_group=dp, sharding_strategy=ShardingStrategy.FULL_SHARD)
-
-    return model
+def precompute_rope(dim, max_len, base=10000.0):
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(max_len)
+    angles = torch.outer(t, freqs)  # (max_len, dim/2)
+    return torch.cos(angles), torch.sin(angles)
 
 
-# ── PP-aware train step (Megatron schedule) ─────────────────────────────────
-
-def _loss_func(labels, output):
-    logits = output.contiguous().float()
-    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
-    return loss, {"lm_loss": loss}
-
-
-def _forward_step(data_iterator, model):
-    batch = next(data_iterator)
-    tokens, labels = batch["input_ids"], batch["labels"]
-    position_ids = torch.arange(tokens.size(1), device=tokens.device).unsqueeze(0).expand_as(tokens)
-    output = model(tokens, position_ids, attention_mask=None)
-    return output, partial(_loss_func, labels)
+def apply_rope(x, cos, sin):
+    # x: (B, n_head, L, head_dim)
+    d2 = x.shape[-1] // 2
+    x1, x2 = x[..., :d2], x[..., d2:]
+    cos, sin = cos[:x.shape[2]], sin[:x.shape[2]]  # trim to seq len
+    cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, L, d2)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
-def train_step(model, data_iterator, cfg: QwenConfig, num_microbatches=1):
-    """One fwd+bwd step.  Megatron handles PP schedule + p2p comm internally."""
-    fwd_bwd = get_forward_backward_func()
-    losses = fwd_bwd(
-        forward_step_func=_forward_step,
-        data_iterator=data_iterator,
-        model=[model],
-        num_microbatches=num_microbatches,
-        seq_length=cfg.max_len,
-        micro_batch_size=1,
-        forward_only=False,
-    )
-    return losses
+# ── GQA with RoPE ────────────────────────────────────────────────────────────
+
+class Attention(nn.Module):
+    def __init__(self, cfg: QwenConfig):
+        super().__init__()
+        self.n_head = cfg.n_head
+        self.n_kv_head = cfg.n_kv_head
+        self.head_dim = cfg.dim // cfg.n_head
+
+        self.wq = nn.Linear(cfg.dim, cfg.dim, bias=True)
+        self.wk = nn.Linear(cfg.dim, self.head_dim * cfg.n_kv_head, bias=True)
+        self.wv = nn.Linear(cfg.dim, self.head_dim * cfg.n_kv_head, bias=False)
+        self.wo = nn.Linear(cfg.dim, cfg.dim, bias=False)
+
+    def forward(self, x, cos, sin):
+        B, L, _ = x.shape
+        q = self.wq(x).view(B, L, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.wk(x).view(B, L, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = self.wv(x).view(B, L, self.n_kv_head, self.head_dim).transpose(1, 2)
+
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        rep = self.n_head // self.n_kv_head
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.wo(out.transpose(1, 2).contiguous().view(B, L, -1))
+
+
+# ── SwiGLU FFN ───────────────────────────────────────────────────────────────
+
+class FFN(nn.Module):
+    def __init__(self, cfg: QwenConfig):
+        super().__init__()
+        self.gate = nn.Linear(cfg.dim, cfg.ffn_hidden, bias=False)
+        self.up   = nn.Linear(cfg.dim, cfg.ffn_hidden, bias=False)
+        self.down  = nn.Linear(cfg.ffn_hidden, cfg.dim, bias=False)
+
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+# ── Transformer Block ────────────────────────────────────────────────────────
+
+class Block(nn.Module):
+    def __init__(self, cfg: QwenConfig):
+        super().__init__()
+        self.attn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.attn = Attention(cfg)
+        self.ffn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.ffn = FFN(cfg)
+
+    def forward(self, x, cos, sin):
+        x = x + self.attn(self.attn_norm(x), cos, sin)
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+
+# ── Full Model ───────────────────────────────────────────────────────────────
+
+class Qwen(nn.Module):
+    def __init__(self, cfg: QwenConfig = QwenConfig()):
+        super().__init__()
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.dim)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
+        self.norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+
+        # Tie weights
+        self.lm_head.weight = self.tok_emb.weight
+
+        # Precompute RoPE
+        cos, sin = precompute_rope(cfg.dim // cfg.n_head, cfg.max_len)
+        self.register_buffer("rope_cos", cos)
+        self.register_buffer("rope_sin", sin)
+
+    def forward(self, idx, targets=None):
+        x = self.tok_emb(idx)
+        for blk in self.blocks:
+            x = blk(x, self.rope_cos, self.rope_sin)
+        logits = self.lm_head(self.norm(x))
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens=100, temperature=1.0, top_k=None):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.cfg.max_len:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = float("-inf")
+            idx = torch.cat([idx, torch.multinomial(F.softmax(logits, dim=-1), 1)], dim=1)
+        return idx
