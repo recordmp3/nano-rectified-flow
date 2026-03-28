@@ -32,57 +32,57 @@ def softmax_bwd_pt(p, dp):
 # ── NumPy version ───────────────────────────────────────────────────────────
 
 def attention_fwd_np(Q, K, V):
-    """Q,K,V: (L, d) → O: (L, d), cache: (P, Q, K, V, scale)"""
+    """Q,K,V: (B, L, d) → O: (B, L, d), cache: (P, Q, K, V, scale)"""
     scale = math.sqrt(K.shape[-1])
-    S = Q @ K.T / scale          # (L, L)
-    P = softmax_fwd_np(S)        # (L, L)
-    O = P @ V                    # (L, d)
+    S = Q @ K.swapaxes(-2, -1) / scale   # (B, L, L)
+    P = softmax_fwd_np(S)                 # (B, L, L)
+    O = P @ V                             # (B, L, d)
     return O, (P, Q, K, V, scale)
 
 
 def attention_bwd_np(dO, cache):
-    """dO: (L, d) → dQ, dK, dV"""
+    """dO: (B, L, d) → dQ, dK, dV"""
     P, Q, K, V, scale = cache
-    dV = P.T @ dO                # (L, d)
-    dP = dO @ V.T                # (L, L)
-    dS = softmax_bwd_np(P, dP)   # (L, L)
-    dQ = dS @ K / scale          # (L, d)
-    dK = dS.T @ Q / scale        # (L, d)
+    dV = P.swapaxes(-2, -1) @ dO                # (B, L, d)
+    dP = dO @ V.swapaxes(-2, -1)                # (B, L, L)
+    dS = softmax_bwd_np(P, dP)                  # (B, L, L)
+    dQ = dS @ K / scale                         # (B, L, d)
+    dK = dS.swapaxes(-2, -1) @ Q / scale        # (B, L, d)
     return dQ, dK, dV
 
 
 # ── PyTorch version ─────────────────────────────────────────────────────────
 
 def attention_fwd_pt(Q, K, V):
-    """Q,K,V: (L, d) → O: (L, d), cache: (P, Q, K, V, scale)"""
+    """Q,K,V: (B, L, d) → O: (B, L, d), cache: (P, Q, K, V, scale)"""
     scale = math.sqrt(K.shape[-1])
-    S = Q @ K.T / scale
-    P = softmax_fwd_pt(S)
-    O = P @ V
+    S = Q @ K.transpose(-2, -1) / scale   # (B, L, L)
+    P = softmax_fwd_pt(S)                  # (B, L, L)
+    O = P @ V                              # (B, L, d)
     return O, (P, Q, K, V, scale)
 
 
 def attention_bwd_pt(dO, cache):
-    """dO: (L, d) → dQ, dK, dV"""
+    """dO: (B, L, d) → dQ, dK, dV"""
     P, Q, K, V, scale = cache
-    dV = P.T @ dO
-    dP = dO @ V.T
-    dS = softmax_bwd_pt(P, dP)
-    dQ = dS @ K / scale
-    dK = dS.T @ Q / scale
+    dV = P.transpose(-2, -1) @ dO                # (B, L, d)
+    dP = dO @ V.transpose(-2, -1)                # (B, L, L)
+    dS = softmax_bwd_pt(P, dP)                   # (B, L, L)
+    dQ = dS @ K / scale                          # (B, L, d)
+    dK = dS.transpose(-2, -1) @ Q / scale        # (B, L, d)
     return dQ, dK, dV
 
 
 # ── Verify: numpy vs pytorch vs autograd ────────────────────────────────────
 
 if __name__ == "__main__":
-    L, d = 4, 8
+    B, L, d = 2, 4, 8
     rng = np.random.default_rng(42)
-    qn, kn, vn = [rng.standard_normal((L, d)).astype(np.float64) for _ in range(3)]
+    qn, kn, vn = [rng.standard_normal((B, L, d)).astype(np.float64) for _ in range(3)]
 
     # NumPy
     O_np, cache_np = attention_fwd_np(qn, kn, vn)
-    dO_np = rng.standard_normal((L, d)).astype(np.float64)
+    dO_np = rng.standard_normal((B, L, d)).astype(np.float64)
     dQ_np, dK_np, dV_np = attention_bwd_np(dO_np, cache_np)
 
     # PyTorch manual
@@ -94,7 +94,7 @@ if __name__ == "__main__":
     # PyTorch autograd (ground truth)
     qa, ka, va = [torch.tensor(x, requires_grad=True) for x in (qn, kn, vn)]
     scale = math.sqrt(d)
-    O_auto = torch.softmax(qa @ ka.T / scale, dim=-1) @ va
+    O_auto = torch.softmax(qa @ ka.transpose(-2, -1) / scale, dim=-1) @ va
     O_auto.backward(dO_t)
 
     print("fwd match (np vs pt):", np.allclose(O_np, O_pt.numpy(), atol=1e-12))
